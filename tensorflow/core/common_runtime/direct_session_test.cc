@@ -16,6 +16,7 @@ limitations under the License.
 #include "tensorflow/core/common_runtime/direct_session.h"
 
 #include <map>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -29,6 +30,7 @@ limitations under the License.
 #include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/graph/costmodel.h"
 #include "tensorflow/core/graph/graph.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/graph/testlib.h"
 #include "tensorflow/core/kernels/ops_util.h"
 #include "tensorflow/core/lib/core/errors.h"
@@ -36,6 +38,7 @@ limitations under the License.
 #include "tensorflow/core/lib/core/status_test_util.h"
 #include "tensorflow/core/lib/core/threadpool.h"
 #include "tensorflow/core/platform/test.h"
+#include "tensorflow/core/platform/test_benchmark.h"
 #include "tensorflow/core/public/session.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/util/device_name_utils.h"
@@ -43,10 +46,10 @@ limitations under the License.
 namespace tensorflow {
 namespace {
 
-Session* CreateSession() {
+std::unique_ptr<Session> CreateSession() {
   SessionOptions options;
   (*options.config.mutable_device_count())["CPU"] = 2;
-  return NewSession(options);
+  return std::unique_ptr<Session>(NewSession(options));
 }
 
 class DirectSessionMinusAXTest : public ::testing::Test {
@@ -85,7 +88,7 @@ class DirectSessionMinusAXTest : public ::testing::Test {
 
 TEST_F(DirectSessionMinusAXTest, RunSimpleNetwork) {
   Initialize({3, 2, -1, 0});
-  std::unique_ptr<Session> session(CreateSession());
+  auto session = CreateSession();
   ASSERT_TRUE(session != nullptr);
   TF_ASSERT_OK(session->Create(def_));
   std::vector<std::pair<string, Tensor>> inputs;
@@ -107,7 +110,7 @@ TEST_F(DirectSessionMinusAXTest, RunSimpleNetwork) {
 
 TEST_F(DirectSessionMinusAXTest, TestFeed) {
   Initialize({1, 2, 3, 4});
-  std::unique_ptr<Session> session(CreateSession());
+  auto session = CreateSession();
   ASSERT_TRUE(session != nullptr);
 
   TF_ASSERT_OK(session->Create(def_));
@@ -136,7 +139,7 @@ TEST_F(DirectSessionMinusAXTest, TestFeed) {
 
 TEST_F(DirectSessionMinusAXTest, TestConcurrency) {
   Initialize({1, 2, 3, 4});
-  std::unique_ptr<Session> session(CreateSession());
+  auto session = CreateSession();
   ASSERT_TRUE(session != nullptr);
   TF_ASSERT_OK(session->Create(def_));
 
@@ -205,7 +208,7 @@ TEST_F(DirectSessionMinusAXTest, TestPerSessionThreads) {
 
 TEST_F(DirectSessionMinusAXTest, TwoCreateCallsFails) {
   Initialize({1, 2, 3, 4});
-  std::unique_ptr<Session> session(CreateSession());
+  auto session = CreateSession();
   ASSERT_TRUE(session != nullptr);
   TF_ASSERT_OK(session->Create(def_));
 
@@ -215,7 +218,7 @@ TEST_F(DirectSessionMinusAXTest, TwoCreateCallsFails) {
 
 TEST_F(DirectSessionMinusAXTest, ForgetToCreate) {
   Initialize({1, 2, 3, 4});
-  std::unique_ptr<Session> session(CreateSession());
+  auto session = CreateSession();
   ASSERT_TRUE(session != nullptr);
   std::vector<std::pair<string, Tensor>> inputs;
   std::vector<Tensor> outputs;
@@ -244,13 +247,8 @@ TEST_F(DirectSessionMinusAXTest, InvalidDevice) {
   (*options.config.mutable_device_count())["CPU"] = 2;
   std::unique_ptr<Session> session(NewSession(options));
   ASSERT_TRUE(session != nullptr);
-  TF_ASSERT_OK(session->Create(def));
-  std::vector<std::pair<string, Tensor>> inputs;
-  std::vector<string> output_names = {y->name() + ":0"};
-  std::vector<Tensor> outputs;
-
   // Should return an error.
-  ASSERT_FALSE(session->Run(inputs, output_names, {}, &outputs).ok());
+  ASSERT_FALSE(session->Create(def).ok());
 
   // Fix placement and run again
   def.Clear();
@@ -258,12 +256,13 @@ TEST_F(DirectSessionMinusAXTest, InvalidDevice) {
   test::graph::ToGraphDef(&graph, &def);
   session.reset(NewSession(options));
   TF_ASSERT_OK(session->Create(def));
-  TF_ASSERT_OK(session->Run(inputs, output_names, {}, &outputs));
+  std::vector<Tensor> outputs;
+  TF_ASSERT_OK(session->Run({}, {y->name() + ":0"}, {}, &outputs));
 }
 
 TEST_F(DirectSessionMinusAXTest, RunSimpleNetworkWithOpts) {
   Initialize({3, 2, -1, 0});
-  std::unique_ptr<Session> session(CreateSession());
+  auto session = CreateSession();
   ASSERT_TRUE(session != nullptr);
   TF_ASSERT_OK(session->Create(def_));
   std::vector<std::pair<string, Tensor>> inputs;
@@ -315,7 +314,7 @@ TEST(DirectSessionTest, KeepsStateAcrossRunsOfSession) {
 
   test::graph::ToGraphDef(&g, &def);
 
-  std::unique_ptr<Session> session(CreateSession());
+  auto session = CreateSession();
   ASSERT_TRUE(session != nullptr);
   TF_ASSERT_OK(session->Create(def));
 
@@ -350,7 +349,7 @@ TEST(DirectSessionTest, MultipleFeedTest) {
 
   test::graph::ToGraphDef(&g, &def);
 
-  std::unique_ptr<Session> session(CreateSession());
+  auto session = CreateSession();
   ASSERT_TRUE(session != nullptr);
   TF_ASSERT_OK(session->Create(def));
 
@@ -397,6 +396,14 @@ TEST(DirectSessionTest, MultipleFeedTest) {
   ASSERT_EQ(2, outputs.size());
   ASSERT_EQ(11.0, outputs[0].flat<float>()(0));
   ASSERT_EQ(22.0, outputs[1].flat<float>()(0));
+
+  // Feed [first_const, first_const]
+  s = session->Run(
+      {{first_const->name(), value_11}, {first_const->name(), value_22}},
+      {first_identity->name() + ":0", second_identity->name() + ":0"}, {},
+      &outputs);
+  EXPECT_TRUE(errors::IsInvalidArgument(s));
+  EXPECT_TRUE(StringPiece(s.error_message()).contains("fed more than once"));
 }
 
 REGISTER_OP("Darth")
@@ -430,7 +437,6 @@ TEST(DirectSessionTest, DarthKernel) {
   std::vector<Tensor> outputs;
   auto s = sess->Run({}, {y->name() + ":0"}, {}, &outputs);
   EXPECT_TRUE(errors::IsInternal(s));
-  delete sess;
 }
 
 // Have the Darth op in the graph placed on GPU, but don't run it.
@@ -446,12 +452,10 @@ TEST(DirectSessionTest, PlacePrunedGraph) {
     test::graph::ToGraphDef(&g, &def);
 
     // By default, we place the entire graph, so we should fail the
-    // call to Run, even if we don't run the bad op.
+    // call to Create.
     SessionOptions options;
     std::unique_ptr<Session> sess(NewSession(options));
-    TF_ASSERT_OK(sess->Create(def));
-    std::vector<Tensor> outputs;
-    auto s = sess->Run({}, {x->name() + ":0"}, {}, &outputs);
+    auto s = sess->Create(def);
     EXPECT_TRUE(errors::IsInvalidArgument(s));
   }
 
@@ -496,7 +500,7 @@ TEST(DirectSessionTest, PartialRunTest) {
 
   test::graph::ToGraphDef(&g, &def);
 
-  std::unique_ptr<Session> session(CreateSession());
+  auto session = CreateSession();
   ASSERT_TRUE(session != nullptr);
   TF_ASSERT_OK(session->Create(def));
 
@@ -552,7 +556,7 @@ TEST(DirectSessionTest, PartialRunMissingFeed) {
 
   test::graph::ToGraphDef(&g, &def);
 
-  std::unique_ptr<Session> session(CreateSession());
+  auto session = CreateSession();
   ASSERT_TRUE(session != nullptr);
   TF_ASSERT_OK(session->Create(def));
 
@@ -585,7 +589,7 @@ TEST(DirectSessionTest, PartialRunMultiOutputFeed) {
 
   test::graph::ToGraphDef(&g, &def);
 
-  std::unique_ptr<Session> session(CreateSession());
+  auto session = CreateSession();
   ASSERT_TRUE(session != nullptr);
   TF_ASSERT_OK(session->Create(def));
 
@@ -623,7 +627,7 @@ TEST(DirectSessionTest, RunHandleTest) {
   value1.scalar<float>()() = 2.0;
   Node* const1 = test::graph::Constant(&g, value1);
   Node* node3 = test::graph::Add(&g, identity0, const1);
-  Node* node4 = test::graph::Unary(&g, "GetSessionHandle", node3);
+  Node* node4 = test::graph::Unary(&g, "GetSessionHandleV2", node3);
 
   Tensor value2(DT_STRING, TensorShape({}));
   Node* const2 = test::graph::Constant(&g, value2);
@@ -634,7 +638,7 @@ TEST(DirectSessionTest, RunHandleTest) {
 
   test::graph::ToGraphDef(&g, &def);
 
-  std::unique_ptr<Session> session(CreateSession());
+  auto session = CreateSession();
   ASSERT_TRUE(session != nullptr);
   TF_ASSERT_OK(session->Create(def));
 
@@ -644,17 +648,21 @@ TEST(DirectSessionTest, RunHandleTest) {
   ASSERT_TRUE(s.ok());
   ASSERT_EQ(1, outputs.size());
 
+  ResourceHandle resource_handle = outputs[0].scalar<ResourceHandle>()();
+  Tensor string_handle(DT_STRING, {});
+  string_handle.flat<string>().setConstant(resource_handle.name());
+
   // Second run call: Use a handle.
   std::vector<Tensor> outputs1;
-  s = session->Run({{const2->name(), outputs[0]}}, {node6->name() + ":0"}, {},
-                   &outputs1);
+  s = session->Run({{const2->name(), string_handle}}, {node6->name() + ":0"},
+                   {}, &outputs1);
   ASSERT_TRUE(s.ok());
   ASSERT_EQ(1, outputs1.size());
   ASSERT_EQ(5.0, outputs1[0].flat<float>()(0));
 
   // Third run call: Delete a handle.
   std::vector<Tensor> outputs2;
-  s = session->Run({{const2->name(), outputs[0]}}, {}, {node7->name()},
+  s = session->Run({{const2->name(), string_handle}}, {}, {node7->name()},
                    &outputs2);
   ASSERT_TRUE(s.ok());
 }
@@ -671,7 +679,7 @@ TEST(DirectSessionTest, CreateGraphFailsWhenAssigningAFedVar) {
   // a = b
   Node* assign = test::graph::Assign(&graph, a, b);
 
-  std::unique_ptr<Session> session(CreateSession());
+  auto session = CreateSession();
   ASSERT_TRUE(session != nullptr);
 
   // The graph is invalid since a constant cannot be assigned to a constant.
@@ -749,30 +757,88 @@ TEST(DirectSessionTest, TimeoutSession) {
   )proto",
                                         &graph);
 
+  {
+    // Creates a session with operation_timeout_in_ms set to 100 milliseconds.
+    SessionOptions options;
+    (*options.config.mutable_device_count())["CPU"] = 2;
+    options.config.set_operation_timeout_in_ms(100);
+
+    std::unique_ptr<Session> session(NewSession(options));
+    ASSERT_TRUE(session != nullptr);
+    TF_ASSERT_OK(session->Create(graph));
+
+    // Verifies that the error code is DEADLINE_EXCEEDED.
+    Status s = session->Run({}, {}, {"fifo_queue_Dequeue"}, nullptr);
+    ASSERT_EQ(error::DEADLINE_EXCEEDED, s.code());
+    TF_ASSERT_OK(session->Close());
+  }
+
+  {
+    // Creates a session with no operation_timeout_in_ms.
+    auto session = CreateSession();
+    ASSERT_TRUE(session != nullptr);
+    TF_ASSERT_OK(session->Create(graph));
+    RunOptions run_options;
+    run_options.set_timeout_in_ms(20);
+    // Verifies that the error code is DEADLINE_EXCEEDED.
+    Status s2 = session->Run(run_options, {}, {}, {"fifo_queue_Dequeue"},
+                             nullptr, nullptr);
+    ASSERT_EQ(error::DEADLINE_EXCEEDED, s2.code());
+    TF_ASSERT_OK(session->Close());
+  }
+}
+
+// Accesses the cancellation manager for the step after the step has been
+// cancelled.
+class CancellationMgrPollingOp : public OpKernel {
+ public:
+  explicit CancellationMgrPollingOp(OpKernelConstruction* ctx)
+      : OpKernel(ctx) {}
+  void Compute(OpKernelContext* ctx) override {
+    CancellationManager* cm = ctx->cancellation_manager();
+    while (!cm->IsCancelled()) {
+      ctx->env()->SleepForMicroseconds(1000);
+    }
+    notification.Notify();
+  }
+  static Notification notification;
+};
+Notification CancellationMgrPollingOp::notification;
+
+REGISTER_KERNEL_BUILDER(Name("CancellationMgrPollingOp").Device(DEVICE_CPU),
+                        CancellationMgrPollingOp);
+REGISTER_OP("CancellationMgrPollingOp").Doc("");
+
+TEST(DirectSessionTest, TestTimeoutCleanShutdown) {
+  GraphDef graph;
+  // Creates a graph with one FIFOQueue and one dequeue op.
+  protobuf::TextFormat::ParseFromString(R"proto(
+    node {
+      name: 'cm_polling'
+      op: 'CancellationMgrPollingOp'
+      device: '/device:CPU:0'
+    }
+    versions {
+      producer: 9
+    }
+  )proto",
+                                        &graph);
+
   // Creates a session with operation_timeout_in_ms set to 100 milliseconds.
   SessionOptions options;
-  (*options.config.mutable_device_count())["CPU"] = 2;
   options.config.set_operation_timeout_in_ms(100);
   std::unique_ptr<Session> session(NewSession(options));
   ASSERT_TRUE(session != nullptr);
   TF_ASSERT_OK(session->Create(graph));
 
   // Verifies that the error code is DEADLINE_EXCEEDED.
-  Status s = session->Run({}, {}, {"fifo_queue_Dequeue"}, nullptr);
+  Status s = session->Run({}, {}, {"cm_polling"}, nullptr);
   ASSERT_EQ(error::DEADLINE_EXCEEDED, s.code());
-  session->Close();
 
-  // Creates a session with no operation_timeout_in_ms.
-  session.reset(CreateSession());
-  ASSERT_TRUE(session != nullptr);
-  TF_ASSERT_OK(session->Create(graph));
-  RunOptions run_options;
-  run_options.set_timeout_in_ms(20);
-  // Verifies that the error code is DEADLINE_EXCEEDED.
-  Status s2 = session->Run(run_options, {}, {}, {"fifo_queue_Dequeue"}, nullptr,
-                           nullptr);
-  ASSERT_EQ(error::DEADLINE_EXCEEDED, s2.code());
-  session->Close();
+  // Verify that the op ran to completion.
+  ASSERT_TRUE(CancellationMgrPollingOp::notification.HasBeenNotified());
+
+  TF_ASSERT_OK(session->Close());
 }
 
 class BlockingOpState {
@@ -823,15 +889,16 @@ static void TestSessionInterOpThreadsImpl(bool use_function_lib) {
         signature: {
           name: "BlockingOpFn" input_arg: { name: "x" type: DT_FLOAT }
                                output_arg: { name: "y" type: DT_FLOAT }}
-        node: { ret: "y" op: "BlockingOp" arg: "x" })proto";
+        node_def: { name: "y" op: "BlockingOp" input: "x" }
+        ret: { key: "y" value: "y:y:0" } )proto";
     CHECK(protobuf::TextFormat::ParseFromString(
         lib, library_graph_def.add_function()));
   }
 
-  FunctionLibraryDefinition flib(library_graph_def);
+  FunctionLibraryDefinition flib(OpRegistry::Global(), library_graph_def);
   Graph g(&flib);
   Tensor t(DT_FLOAT, TensorShape({}));
-  t.scalar<float>()() = {1.2};
+  t.scalar<float>()() = {1.2f};
   Node* x = test::graph::Constant(&g, t);
   Node* y;
   if (use_function_lib) {
@@ -851,6 +918,8 @@ static void TestSessionInterOpThreadsImpl(bool use_function_lib) {
       ->mutable_optimizer_options()
       ->set_opt_level(OptimizerOptions_Level_L0);
   (*options.config.mutable_device_count())["CPU"] = 2;
+  (*options.config.mutable_device_count())["GPU"] = 0;
+  (*options.config.mutable_device_count())["SYCL"] = 0;
 
   options.config.add_session_inter_op_thread_pool();
   auto* p = options.config.add_session_inter_op_thread_pool();
@@ -873,7 +942,7 @@ static void TestSessionInterOpThreadsImpl(bool use_function_lib) {
       Status s = session->Run(run_options, {} /* inputs */,
                               {node->name() + ":0"} /* output_names */, {},
                               &outputs, nullptr /* run_metadata */);
-      TF_ASSERT_OK(s);
+      TF_CHECK_OK(s);
       ASSERT_EQ(1, outputs.size());
       auto flat = outputs[0].flat<float>();
       EXPECT_FLOAT_EQ(1.2, flat(0));
@@ -940,7 +1009,7 @@ TEST(DirectSessionTest, TestSessionInterOpThreadsWithFunctions) {
 TEST(DirectSessionTest, TestSessionInterOpThreadsInvalidOptions) {
   Graph g(OpRegistry::Global());
   Tensor t(DT_FLOAT, TensorShape({}));
-  t.scalar<float>()() = {1.2};
+  t.scalar<float>()() = {1.2f};
   Node* x = test::graph::Constant(&g, t);
   GraphDef def;
   test::graph::ToGraphDef(&g, &def);
@@ -969,6 +1038,192 @@ TEST(DirectSessionTest, TestSessionInterOpThreadsInvalidOptions) {
               s.ToString());
   }
 }
+
+TEST(DirectSessionTest, TestDirectSessionRunClose) {
+  // Construct a graph with a variable and a single assign.
+  Graph g(OpRegistry::Global());
+  Tensor t(DT_FLOAT, TensorShape({}));
+  t.scalar<float>()() = {1.2f};
+  Node* var_val = test::graph::Constant(&g, t);
+  Node* var = test::graph::Var(&g, DT_FLOAT, {});
+  Node* var_assign = test::graph::Assign(&g, var, var_val);
+  GraphDef def;
+  test::graph::ToGraphDef(&g, &def);
+
+  SessionOptions options;
+  (*options.config.mutable_device_count())["CPU"] = 2;
+  std::unique_ptr<Session> session(NewSession(options));
+  ASSERT_TRUE(session != nullptr);
+  TF_ASSERT_OK(session->Create(def));
+
+  // Assign a value to the var.
+  TF_ASSERT_OK(session->Run({} /* inputs */, {},
+                            {var_assign->name()} /* target_nodes */, nullptr));
+
+  // Run a read on the variable to ensure that it works.
+  std::vector<Tensor> outputs;
+  TF_ASSERT_OK(session->Run(
+      {} /* inputs */, {var->name() + ":0"} /* output_names */, {}, &outputs));
+  EXPECT_EQ(t.scalar<float>()(), outputs[0].scalar<float>()());
+  outputs.clear();
+
+  // Close the session.
+  TF_ASSERT_OK(session->Close());
+
+  // Run the read on the variable to get an error.
+  Status s = session->Run({} /* inputs */, {},
+                          {var_assign->name()} /* target_nodes */, nullptr);
+  EXPECT_EQ("Cancelled: Session has been closed.", s.ToString());
+}
+
+TEST(DirectSessionTest, TestDirectSessionPRunClose) {
+  GraphDef def;
+  Graph g(OpRegistry::Global());
+
+  Tensor first_value(DT_FLOAT, TensorShape({}));
+  first_value.scalar<float>()() = 1.0;
+  Node* first_const = test::graph::Constant(&g, first_value);
+  Node* first_identity = test::graph::Identity(&g, first_const);
+
+  Tensor second_value(DT_FLOAT, TensorShape({}));
+  second_value.scalar<float>()() = 2.0;
+  Node* second_const = test::graph::Constant(&g, second_value);
+  Node* second_identity = test::graph::Identity(&g, second_const);
+
+  Node* third = test::graph::Add(&g, first_identity, second_identity);
+  Node* third_identity = test::graph::Identity(&g, third);
+
+  test::graph::ToGraphDef(&g, &def);
+
+  auto session = CreateSession();
+  ASSERT_TRUE(session != nullptr);
+  TF_ASSERT_OK(session->Create(def));
+
+  std::vector<Tensor> outputs;
+
+  string handle;
+  Status s = session->PRunSetup(
+      {first_const->name(), second_const->name()},
+      {first_identity->name() + ":0", second_identity->name() + ":0",
+       third_identity->name() + ":0"},
+      {}, &handle);
+  TF_ASSERT_OK(s);
+
+  Tensor value_11(DT_FLOAT, TensorShape({}));
+  value_11.scalar<float>()() = 11.0;
+  Tensor value_22(DT_FLOAT, TensorShape({}));
+  value_22.scalar<float>()() = 22.0;
+
+  // Close the session.
+  TF_ASSERT_OK(session->Close());
+
+  // Feed first_const, fetch first_identity
+  s = session->PRun(handle, {{first_const->name(), value_11}},
+                    {first_identity->name() + ":0"}, &outputs);
+  EXPECT_EQ("Cancelled: Session has been closed.", s.ToString());
+}
+
+TEST(DirectSessionTest, TestDirectSessionReset) {
+  // Construct a graph with a variable and a single assign.
+  Graph g(OpRegistry::Global());
+  Tensor t(DT_FLOAT, TensorShape({}));
+  t.scalar<float>()() = {1.2f};
+  Node* var_val = test::graph::Constant(&g, t);
+  Node* var = test::graph::Var(&g, DT_FLOAT, {});
+  Node* var_assign = test::graph::Assign(&g, var, var_val);
+  GraphDef def;
+  test::graph::ToGraphDef(&g, &def);
+
+  SessionOptions options;
+  (*options.config.mutable_device_count())["CPU"] = 2;
+  std::unique_ptr<Session> session(NewSession(options));
+  ASSERT_TRUE(session != nullptr);
+  TF_ASSERT_OK(session->Create(def));
+
+  // Assign a value to the var.
+  TF_ASSERT_OK(session->Run({} /* inputs */, {},
+                            {var_assign->name()} /* target_nodes */, nullptr));
+
+  // Run a read on the variable to ensure that it works.
+  std::vector<Tensor> outputs;
+  TF_ASSERT_OK(session->Run(
+      {} /* inputs */, {var->name() + ":0"} /* output_names */, {}, &outputs));
+  EXPECT_EQ(t.scalar<float>()(), outputs[0].scalar<float>()());
+  outputs.clear();
+
+  // Reset the containers.
+  TF_EXPECT_OK(Reset(options, {}));
+
+  // Run the read on the variable to get an error.
+  // TODO(suharshs): This test only works because we close the Session in Reset.
+  // If we change the behavior of Reset to not close the Session, this test will
+  // fail, since the Variable buffer is cached by var.
+  Status s = session->Run({} /* inputs */, {},
+                          {var_assign->name()} /* target_nodes */, nullptr);
+  EXPECT_EQ("Cancelled: Session has been closed.", s.ToString());
+}
+
+// A simple benchmark for the overhead of `DirectSession::Run()` calls
+// with varying numbers of feeds/fetches.
+void FeedFetchBenchmarkHelper(int num_feeds, int iters) {
+  testing::StopTiming();
+
+  Tensor value(DT_FLOAT, TensorShape());
+  value.flat<float>()(0) = 37.0;
+
+  std::vector<std::pair<string, Tensor>> inputs;
+  inputs.reserve(num_feeds);
+  std::vector<string> outputs;
+
+  Graph g(OpRegistry::Global());
+  for (int i = 0; i < num_feeds; ++i) {
+    // NOTE(mrry): We pin nodes to the "/cpu:0" device, so as not to
+    // measure CPU<->GPU copying overhead. We should also optimize and
+    // monitor this overhead where possible, but that is not the
+    // object of study in this benchmark.
+    Node* placeholder;
+    TF_CHECK_OK(NodeBuilder(g.NewName("Placeholder"), "Placeholder")
+                    .Attr("shape", TensorShape())
+                    .Attr("dtype", DT_FLOAT)
+                    .Device("/cpu:0")
+                    .Finalize(&g, &placeholder));
+    Node* identity;
+    TF_CHECK_OK(NodeBuilder(g.NewName("Identity"), "Identity")
+                    .Input(placeholder)
+                    .Attr("T", DT_FLOAT)
+                    .Device("/cpu:0")
+                    .Finalize(&g, &identity));
+    inputs.push_back({placeholder->name() + ":0", value});
+    outputs.push_back(identity->name() + ":0");
+  }
+  GraphDef gd;
+  g.ToGraphDef(&gd);
+  SessionOptions opts;
+  std::unique_ptr<Session> session(NewSession(opts));
+  TF_CHECK_OK(session->Create(gd));
+  {
+    // NOTE(mrry): Ignore the first run, which will incur the graph
+    // partitioning/pruning overhead and skew the results.
+    //
+    // Note that we should also optimize and monitor the overhead on
+    // the first run, which will impact application startup times, but
+    // that is not the object of study in this benchmark.
+    std::vector<Tensor> output_values;
+    TF_CHECK_OK(session->Run(inputs, outputs, {}, &output_values));
+  }
+  testing::StartTiming();
+  for (int i = 0; i < iters; ++i) {
+    std::vector<Tensor> output_values;
+    TF_CHECK_OK(session->Run(inputs, outputs, {}, &output_values));
+  }
+  testing::StopTiming();
+}
+
+void BM_FeedFetch(int iters, int num_feeds) {
+  FeedFetchBenchmarkHelper(iters, num_feeds);
+}
+
+BENCHMARK(BM_FeedFetch)->Arg(1)->Arg(2)->Arg(5)->Arg(10);
 
 }  // namespace
 }  // namespace tensorflow

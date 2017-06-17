@@ -19,11 +19,11 @@ limitations under the License.
 
 #include <stdlib.h>
 
-#include "tensorflow/core/common_runtime/gpu/cupti_wrapper.h"
 #include "tensorflow/core/common_runtime/step_stats_collector.h"
 #include "tensorflow/core/framework/step_stats.pb.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/strings/stringprintf.h"
+#include "tensorflow/core/platform/cupti_wrapper.h"
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/mem.h"
@@ -127,7 +127,7 @@ class CUPTIClient {
 class CUPTIManager {
  public:
   CUPTIManager() {
-    cupti_wrapper_.reset(new CuptiWrapper());
+    cupti_wrapper_.reset(new perftools::gputools::profiler::CuptiWrapper());
     CUPTI_CALL(ActivityRegisterCallbacks(BufferRequested, BufferCompleted));
   }
 
@@ -163,7 +163,7 @@ class CUPTIManager {
 
   mutex mu_;
   CUPTIClient *client_ GUARDED_BY(mu_);
-  std::unique_ptr<CuptiWrapper> cupti_wrapper_;
+  std::unique_ptr<perftools::gputools::profiler::CuptiWrapper> cupti_wrapper_;
 
   TF_DISALLOW_COPY_AND_ASSIGN(CUPTIManager);
 };
@@ -215,7 +215,7 @@ Status CUPTIManager::DisableTrace() {
 void CUPTIManager::InternalBufferRequested(uint8_t **buffer, size_t *size,
                                            size_t *maxNumRecords) {
   VLOG(2) << "BufferRequested";
-  void *p = port::aligned_malloc(kBufferSize, kBufferAlignment);
+  void *p = port::AlignedMalloc(kBufferSize, kBufferAlignment);
   *size = kBufferSize;
   *buffer = reinterpret_cast<uint8_t *>(p);
   *maxNumRecords = 0;
@@ -226,7 +226,7 @@ void CUPTIManager::InternalBufferCompleted(CUcontext ctx, uint32_t streamId,
                                            size_t validSize) {
   VLOG(2) << "BufferCompleted";
   CUptiResult status;
-  CUpti_Activity *record = NULL;
+  CUpti_Activity *record = nullptr;
   mutex_lock l(mu_);  // Hold mu_ while using client_.
   if (client_ && validSize > 0) {
     do {
@@ -246,13 +246,17 @@ void CUPTIManager::InternalBufferCompleted(CUcontext ctx, uint32_t streamId,
       LOG(WARNING) << "Dropped " << dropped << " activity records";
     }
   }
-  port::aligned_free(buffer);
+  port::AlignedFree(buffer);
 }
 
 CUPTIManager *GetCUPTIManager() {
   static CUPTIManager *manager = new CUPTIManager();
   return manager;
 }
+
+#ifdef _MSC_VER
+#define __thread __declspec(thread) 
+#endif
 
 // TODO(pbar) Move this to platform specific header file?
 // Static thread local variable for POD types.
@@ -284,6 +288,7 @@ class GPUTracerImpl : public GPUTracer,
                       public port::Tracing::Engine {
  public:
   GPUTracerImpl();
+  ~GPUTracerImpl() override;
 
   // GPUTracer interface:
   Status Start() override;
@@ -303,7 +308,7 @@ class GPUTracerImpl : public GPUTracer,
         // Remember the most recent ScopedAnnotation for each thread.
         tls_current_annotation.get() = annotation.c_str();
       }
-      ~Impl() { tls_current_annotation.get() = nullptr; }
+      ~Impl() override { tls_current_annotation.get() = nullptr; }
     };
     return new Impl(name);
   }
@@ -351,7 +356,7 @@ class GPUTracerImpl : public GPUTracer,
   inline int64 NowInUsec() { return Env::Default()->NowMicros(); }
 
   CUPTIManager *cupti_manager_;
-  std::unique_ptr<CuptiWrapper> cupti_wrapper_;
+  std::unique_ptr<perftools::gputools::profiler::CuptiWrapper> cupti_wrapper_;
   CUpti_SubscriberHandle subscriber_;
 
   mutex trace_mu_;
@@ -374,8 +379,14 @@ GPUTracerImpl::GPUTracerImpl() {
   VLOG(1) << "GPUTracer created.";
   cupti_manager_ = GetCUPTIManager();
   CHECK(cupti_manager_);
-  cupti_wrapper_.reset(new CuptiWrapper());
+  cupti_wrapper_.reset(new perftools::gputools::profiler::CuptiWrapper());
   enabled_ = false;
+}
+
+GPUTracerImpl::~GPUTracerImpl() {
+  // Unregister the CUPTI callbacks if needed to prevent them from accessing
+  // freed memory.
+  Stop().IgnoreError();
 }
 
 Status GPUTracerImpl::Start() {
@@ -387,8 +398,8 @@ Status GPUTracerImpl::Start() {
   // There can only be one CUPTI subscriber.  If we can't create one then
   // there is another trace in progress (possibly by external code).
   CUptiResult ret;
-  ret = cupti_wrapper_->Subscribe(&subscriber_, (CUpti_CallbackFunc)ApiCallback,
-                                  this);
+  ret = cupti_wrapper_->Subscribe(
+      &subscriber_, static_cast<CUpti_CallbackFunc>(ApiCallback), this);
   if (ret == CUPTI_ERROR_MAX_LIMIT_REACHED) {
     return errors::Unavailable("CUPTI subcriber limit reached.");
   } else if (ret != CUPTI_SUCCESS) {
@@ -479,20 +490,25 @@ void GPUTracerImpl::AddCorrelationId(uint32 correlation_id,
     if (cbInfo->callbackSite == CUPTI_API_ENTER) {
       auto *params = reinterpret_cast<const cuLaunchKernel_params *>(
           cbInfo->functionParams);
-      VLOG(2) << "LAUNCH stream " << params->hStream << " correllation "
-              << cbInfo->correlationId << " kernel " << cbInfo->symbolName;
+      if (VLOG_IS_ON(2)) {
+        VLOG(2) << "LAUNCH stream " << params->hStream << " correllation "
+                << cbInfo->correlationId << " kernel " << cbInfo->symbolName;
+      }
       const string annotation =
           tls_annotation ? tls_annotation : cbInfo->symbolName;
       tracer->AddCorrelationId(cbInfo->correlationId, annotation);
     }
   } else if ((domain == CUPTI_CB_DOMAIN_RUNTIME_API) &&
-             (cbid == CUPTI_RUNTIME_TRACE_CBID_cudaMemcpy_v3020)) {
+             (cbid == CUPTI_RUNTIME_TRACE_CBID_cudaMemcpy_v3020 ||
+              cbid == CUPTI_RUNTIME_TRACE_CBID_cudaMemcpyAsync_v3020)) {
     if (cbInfo->callbackSite == CUPTI_API_ENTER) {
-      auto *funcParams = reinterpret_cast<const cudaMemcpy_v3020_params *>(
-          cbInfo->functionParams);
-      size_t count = funcParams->count;
-      enum cudaMemcpyKind kind = funcParams->kind;
-      VLOG(2) << "MEMCPY count " << count << " kind " << kind;
+      if (VLOG_IS_ON(2)) {
+        auto *funcParams = reinterpret_cast<const cudaMemcpy_v3020_params *>(
+            cbInfo->functionParams);
+        size_t count = funcParams->count;
+        enum cudaMemcpyKind kind = funcParams->kind;
+        VLOG(2) << "MEMCPY count " << count << " kind " << kind;
+      }
       if (tls_annotation) {
         const string annotation = tls_annotation;
         tracer->AddCorrelationId(cbInfo->correlationId, annotation);
@@ -510,7 +526,7 @@ void GPUTracerImpl::AddCorrelationId(uint32 correlation_id,
       tracer->AddCorrelationId(cbInfo->correlationId, annotation);
     }
   } else {
-    LOG(WARNING) << "Unhandled API Callback for " << domain << " " << cbid;
+    VLOG(1) << "Unhandled API Callback for " << domain << " " << cbid;
   }
 }
 
@@ -552,7 +568,6 @@ Status GPUTracerImpl::Collect(StepStatsCollector *collector) {
   const int id = 0;
   const string stream_device = strings::StrCat(prefix, "/gpu:", id, "/stream:");
   const string memcpy_device = strings::StrCat(prefix, "/gpu:", id, "/memcpy");
-  const string sync_device = strings::StrCat(prefix, "/gpu:", id, "/sync");
 
   mutex_lock l2(trace_mu_);
   for (const auto &rec : kernel_records_) {

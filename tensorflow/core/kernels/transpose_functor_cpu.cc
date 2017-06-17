@@ -61,10 +61,133 @@ void TransposeUsingEigen(const Device& d, const Tensor& in,
 
 }  // end namespace internal
 
-typedef Eigen::ThreadPoolDevice Device;
+typedef Eigen::ThreadPoolDevice CPUDevice;
+
+template <typename T>
+struct Transpose<CPUDevice, T> {
+  static void run(const CPUDevice& d, const Tensor& in,
+                  const gtl::ArraySlice<int32> perm, Tensor* out) {
+    switch (in.dims()) {
+      case 2:
+        internal::TransposeUsingEigen<CPUDevice, T, 2>(d, in, perm, out);
+        break;
+      case 3:
+        internal::TransposeUsingEigen<CPUDevice, T, 3>(d, in, perm, out);
+        break;
+      case 4:
+        internal::TransposeUsingEigen<CPUDevice, T, 4>(d, in, perm, out);
+        break;
+      case 5:
+        internal::TransposeUsingEigen<CPUDevice, T, 5>(d, in, perm, out);
+        break;
+      default:
+        internal::TransposeSimple<CPUDevice, T>(d, in, perm, out);
+        break;
+    }
+  }
+};
+
+// TODO(yangzihao): Merge this code with its GPU counterpart to reduce code
+// duplication.
+template <>
+Status DoTranspose<CPUDevice>(const CPUDevice& d, const Tensor& in,
+                              const gtl::ArraySlice<int32> perm, Tensor* out) {
+  typedef CPUDevice Device;
+  CHECK_GE(in.dims(), 2);
+  CHECK_EQ(in.dims(), out->dims());
+  CHECK_EQ(in.dims(), perm.size());
+  CHECK_EQ(in.dtype(), out->dtype());
+  switch (in.dtype()) {
+    case DT_BOOL:
+    case DT_INT8:
+    case DT_QINT8:
+    case DT_QUINT8:
+    case DT_UINT8:
+      Transpose<Device, uint8>::run(d, in, perm, out);
+      break;
+
+    case DT_BFLOAT16:
+    case DT_HALF:
+    case DT_INT16:
+    case DT_QINT16:
+    case DT_QUINT16:
+    case DT_UINT16:
+      Transpose<Device, uint16>::run(d, in, perm, out);
+      break;
+
+    case DT_FLOAT:
+    case DT_INT32:
+    case DT_QINT32:
+      Transpose<Device, uint32>::run(d, in, perm, out);
+      break;
+
+    case DT_COMPLEX64:
+    case DT_DOUBLE:
+    case DT_INT64:
+      Transpose<Device, uint64>::run(d, in, perm, out);
+      break;
+
+    case DT_COMPLEX128:
+      Transpose<Device, complex128>::run(d, in, perm, out);
+      break;
+
+    case DT_STRING:
+      Transpose<Device, string>::run(d, in, perm, out);
+      break;
+
+    default:
+      return errors::Unimplemented("Unsupported dtype on CPU: ", in.dtype());
+  }
+  return Status::OK();
+}
+
+#ifdef TENSORFLOW_USE_SYCL
+typedef Eigen::SyclDevice SYCLDevice;
+
+template <typename Device, typename T>
+void TransposeSYCL(const Device& d, const Tensor& in,
+               const gtl::ArraySlice<int32> perm, Tensor* out) {
+  switch (in.dims()) {
+    case 1:
+      internal::TransposeUsingEigen<Device, T, 1>(d, in, perm, out);
+      break;
+    case 2:
+      internal::TransposeUsingEigen<Device, T, 2>(d, in, perm, out);
+      break;
+    case 3:
+      internal::TransposeUsingEigen<Device, T, 3>(d, in, perm, out);
+      break;
+    case 4:
+      internal::TransposeUsingEigen<Device, T, 4>(d, in, perm, out);
+      break;
+    case 5:
+      internal::TransposeUsingEigen<Device, T, 5>(d, in, perm, out);
+      break;
+    case 6:
+      internal::TransposeUsingEigen<Device, T, 6>(d, in, perm, out);
+      break;
+    case 7:
+      internal::TransposeUsingEigen<Device, T, 7>(d, in, perm, out);
+      break;
+    case 8:
+      internal::TransposeUsingEigen<Device, T, 8>(d, in, perm, out);
+      break;
+    default:
+      LOG(FATAL) << "Unsupported TransposeUsingEigen for: " << in.dims();
+      break;
+  }
+}
+
+template <typename T>
+struct Transpose<SYCLDevice, T> {
+  static void run(const SYCLDevice& d, const Tensor& in,
+                  const gtl::ArraySlice<int32> perm, Tensor* out) {
+    // Should add a specialized implementation for SYCLDevice here.
+  }
+};
 
 template <>
-Status DoTranspose<Device>(const Device& d, const Tensor& in,
+Status DoTranspose<SYCLDevice>(const SYCLDevice& d, const Tensor& in,
                            const gtl::ArraySlice<int32> perm, Tensor* out) {
   CHECK_GE(in.dims(), 2);
   CHECK_EQ(in.dims(), out->dims());
@@ -76,41 +199,38 @@ Status DoTranspose<Device>(const Device& d, const Tensor& in,
     case DT_QINT8:
     case DT_QUINT8:
     case DT_UINT8:
-      internal::Transpose<Device, uint8>(d, in, perm, out);
+      TransposeSYCL<SYCLDevice, uint8>(d, in, perm, out);
       break;
 
     case DT_BFLOAT16:
+    case DT_HALF:
     case DT_INT16:
     case DT_QINT16:
     case DT_QUINT16:
     case DT_UINT16:
-      internal::Transpose<Device, uint16>(d, in, perm, out);
+      TransposeSYCL<SYCLDevice, uint16>(d, in, perm, out);
       break;
-
     case DT_FLOAT:
     case DT_INT32:
     case DT_QINT32:
-      internal::Transpose<Device, uint32>(d, in, perm, out);
+      TransposeSYCL<SYCLDevice, uint32>(d, in, perm, out);
       break;
 
     case DT_COMPLEX64:
     case DT_DOUBLE:
     case DT_INT64:
-      internal::Transpose<Device, uint64>(d, in, perm, out);
+      TransposeSYCL<SYCLDevice, uint64>(d, in, perm, out);
       break;
 
     case DT_COMPLEX128:
-      internal::Transpose<Device, complex128>(d, in, perm, out);
-      break;
-
-    case DT_STRING:
-      internal::Transpose<Device, string>(d, in, perm, out);
+      TransposeSYCL<SYCLDevice, complex128>(d, in, perm, out);
       break;
 
     default:
-      return errors::Unimplemented("Unsupported dtype on CPU: ", in.dtype());
+      return errors::Unimplemented("Unsupported dtype on SYCL: ", in.dtype());
   }
   return Status::OK();
 }
+#endif // TENSORFLOW_USE_SYCL
 
 }  // namespace tensorflow
